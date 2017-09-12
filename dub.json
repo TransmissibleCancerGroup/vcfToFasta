@@ -1,0 +1,13 @@
+{
+	"name": "vcftofasta",
+    "targetName": "vcfToFasta",
+	"authors": [
+		"Kevin Gori - kcg25@cam.ac.uk"
+	],
+    "dependencies": {
+        "darg": "~>0.0.4"
+    },
+	"description": "An application to convert SNP data in a VCF file to a sequence alignment in fasta format",
+	"copyright": "Copyright © 2017, Kevin Gori",
+	"license": "MIT"
+}
