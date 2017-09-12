@@ -205,7 +205,7 @@ struct Options {
 }
 
 // Generate the usage and help string at compile time.
-immutable usage = usageString!Options("extractSNPs ");
+immutable usage = usageString!Options("vcfToFasta ");
 immutable help = helpString!Options;
 
 int main(string[] args)
