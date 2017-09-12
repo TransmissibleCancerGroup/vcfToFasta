@@ -67,12 +67,40 @@ unittest {
     assert(examineGenotype("./.:::::") == VariantResult.IsAmbiguous);
 }
 
+// Consume the front item of a range
+auto pop(Range)(ref Range r) if (isInputRange!Range) {
+    if (r.empty) {
+        ElementType!Range val;
+        return val;
+    }
+    auto f = r.front;
+    r.popFront();
+    return f;
+}
+
+unittest {
+    string s = "a\tb\tc\td\te";
+    auto spl = s.splitter('\t');
+    string f = pop(spl);
+    assert(f == "a");
+    assert(spl == s.splitter('\t').drop(1));
+    string g = pop(spl);
+    assert(g == "b");
+    assert(spl == s.splitter('\t').drop(2));
+
+    s = "";
+    spl = s.splitter('\t');
+    f = pop(spl);
+    assert(spl.empty);
+    assert(f == "");
+}
+
 auto examineCoverage(string sampleData, int min_total_cov, int min_alt_cov) {
     // Assuming sample data format is GT:GL:GOF:GQ:NR:NV
     auto splitLine = sampleData.splitter(':').drop(4);
 
-    int nr = to!int(splitLine.front); splitLine.popFront(); // parse out 2nd-last field
-    int nv = to!int(splitLine.front); splitLine.popFront(); // parse out last field
+    int nr = to!int(pop(splitLine)); // parse out 2nd-last field
+    int nv = to!int(pop(splitLine)); // parse out last field
 
     if (nr < min_total_cov) {
         return VariantResult.IsAmbiguous;
@@ -96,11 +124,13 @@ unittest {
 
 void processVcfLine(ref Sequence[] sequences, ref Sequence reference, string line,
         bool excludeInvariant, int mintot, int minalt, bool gInfo) {
+
+    // Grab what we want from the tab-separated fields
     auto splitLine = line.splitter("\t");
-    auto chrom = splitLine.front; splitLine.popFront();
-    auto pos = splitLine.front; splitLine.popFront();
+    auto chrom = pop(splitLine);
+    auto pos = pop(splitLine);
     splitLine = splitLine.drop(1);
-    string refBase = splitLine.front; splitLine.popFront();
+    string refBase = pop(splitLine);
     auto altBase = splitLine.front;
 
     // add a collector here to check if this site is invariant
@@ -144,6 +174,8 @@ void processVcfLine(ref Sequence[] sequences, ref Sequence reference, string lin
     }
 }
 
+// This struct represents a sequence. It holds the sequence name (`name`)
+// and an appender (`seq`) to hold the growing sequence
 struct Sequence {
     string name;
     Appender!(string) seq;
@@ -153,27 +185,35 @@ unittest {
     string line = "\t\t\tT\tC\t\t\t\tGT:GL:GOF:GQ:NR:NV\t1/1::::8:0\t1/1::::15:6";
     Sequence[] seqs = [Sequence("a"), Sequence("b")];
     Sequence refseq = Sequence("ref");
+
+    // Use genotype strings - both sites are alt
     processVcfLine(seqs, refseq, line, false, 10, 5, true);
     assert(seqs[0].seq.data[0] == 'C');
     assert(seqs[1].seq.data[0] == 'C');
     assert(refseq.seq.data[0] == 'T');
 
+    // Use coverage counts - site 1 is ref, 2 is alt
     processVcfLine(seqs, refseq, line, false, 10, 5, false);
     assert(seqs[0].seq.data[1] == 'T');
     assert(seqs[1].seq.data[1] == 'C');
     assert(refseq.seq.data[1] == 'T');
 
+    // Use coverage counts - both sites are ref at these thresholds
+    // this site is invariant, but not filtered out
     processVcfLine(seqs, refseq, line, false, 100, 50, false);
-    assert(seqs[0].seq.data[2] == 'T');
-    assert(seqs[1].seq.data[2] == 'T');
-    assert(refseq.seq.data[2] == 'T');
+    assert(seqs[0].seq.data[2] == 'T' && seqs[0].seq.data.length == 3);
+    assert(seqs[1].seq.data[2] == 'T' && seqs[1].seq.data.length == 3);
+    assert(refseq.seq.data[2] == 'T' && refseq.seq.data.length == 3);
 
+    // As above, but filtered out (array is same size)
     processVcfLine(seqs, refseq, line, true, 100, 50, false);
     assert(seqs[0].seq.data.length == 3);
     assert(seqs[1].seq.data.length == 3);
     assert(refseq.seq.data.length == 3);
 }
 
+
+// This struct holds command line arguments
 struct Options {
     @Option("help", "h")
     @Help("This help information")
@@ -208,6 +248,7 @@ struct Options {
 immutable usage = usageString!Options("vcfToFasta ");
 immutable help = helpString!Options;
 
+// main handles the commandline and dispatches all work to `run`
 int main(string[] args)
 {
     Options options;
@@ -228,8 +269,9 @@ int main(string[] args)
     return run(options);
 }
 
+// Does all the work
 int run(Options options) {
-
+    // Won't get too far if the infile doesn't exist
     if (!exists(options.infilename)) {
         stderr.writefln("Couldn't open %s", options.infilename);
         return 1;
@@ -238,23 +280,32 @@ int run(Options options) {
     auto file = File(options.infilename, "r");
     scope(exit) file.close();
 
+    // This array will hold the growing sequence info for each sample
     Sequence[] sequences;
 
-    // add reference seq
+    // Also keep track of the reference sequence
     auto refseq = Sequence("Reference");
 
+    // Need to initialise the sequences only once - when we reach
+    // the VCF column headers line, which starts with a single '#'
     bool initialised = false;
 
-    ulong counter = 0;
+    ulong loopcounter = 0; // Just for monitoring progress
 
+    // Loop over the VCF file and process each line
     foreach (line; file.byLine()) {
-        if (line.startsWith("##")) continue;
+        if (line.startsWith("##")) {
+            // Ignore these lines
+            continue;
+        }
         try {
             if (line.startsWith("#") && !initialised) {
+                // Reached the headers - initialise data structure
                 sequences = getSequences(to!string(line));
                 initialised = true;
             }
             else {
+                // Process a line and extract next sequence residue
                 processVcfLine(sequences, refseq, to!string(line),
                     options.excludeInvariant, options.min_total_cov,
                     options.min_alt_cov, options.useGenotypeInfo);
@@ -265,14 +316,16 @@ int run(Options options) {
                      options.infilename);
             return 1;
         }
-        counter++;
-        if (counter % 100000 == 0) {
-            stderr.writefln("Processed %d SNPs", counter);
+
+        // Rudimentary progress monitor
+        loopcounter++;
+        if (loopcounter % 100000 == 0) {
+            stderr.writefln("Processed %d SNPs", loopcounter);
             stderr.flush();
         }
-        // if (counter > 1000000) break;
     }
 
+    // Write Fasta to standard out
     foreach (ref sequence; chain([refseq], sequences)) {
         writefln(">%s", sequence.name);
         foreach (ref chunk; sequence.seq.data.chunks(80)) {
