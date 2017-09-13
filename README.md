@@ -1,6 +1,11 @@
 # vcfToFasta
 Convert SNP data in a somatypus VCF file to an alignment in Fasta format
 
+### Compilation
+This is a D program, and can be built using dub. The binary in the repo was built on ```Ubuntu 12.04.5 LTS``` using the command
+    
+    dub build --compiler=ldc2 --build=release
+
 ### Basic usage
     Usage: vcfToFasta [--help] [--excludeInvariant] [--useGenotypeInfo]
                     [--min_total_cov=<uint>] [--min_alt_cov=<uint>] vcffile
