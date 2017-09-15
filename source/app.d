@@ -27,14 +27,14 @@ enum VariantResult {
     IsAmbiguous
 }
 
-enum char[string] ambiguityCodes = [
-        "AC": 'M', "AG": 'R', "AT": 'W',
-        "CA": 'M', "CG": 'S', "CT": 'Y',
-        "GA": 'R', "GC": 'S', "GT": 'K',
-        "TA": 'W', "TC": 'Y', "TG": 'K'
+enum string[string] ambiguityCodes = [
+    "AC": "M", "AG": "R", "AT": "W",
+    "CA": "M", "CG": "S", "CT": "Y",
+    "GA": "R", "GC": "S", "GT": "K",
+    "TA": "W", "TC": "Y", "TG": "K"
 ];
 
-char getAmbiguityCode(string chars)
+string getAmbiguityCode(string chars)
 in {
     assert(chars.length == 2);
 }
@@ -43,12 +43,12 @@ body {
 }
 
 unittest {
-    static assert(getAmbiguityCode("AC") == 'M');
+    static assert(getAmbiguityCode("AC") == "M");
     string refBase = "A";
     string altBase = "T";
-    char ambig = getAmbiguityCode(refBase ~ altBase);
-    assert(ambig == 'W');
-    assert(getAmbiguityCode("TA") == 'W');
+    string ambig = getAmbiguityCode(refBase ~ altBase);
+    assert(ambig == "W");
+    assert(getAmbiguityCode("TA") == "W");
 }
 
 // Reduce 2 Variant results to 1 - if they differ, result is ambiguous
@@ -149,13 +149,23 @@ unittest {
 
 
 enum int[dchar] baseToBits = [
-        'A': 0x1, 'C': 0x2, 'G': 0x4, 'T': 0x8,
-        'M': 0x1|0x2, 'R': 0x1|0x4, 'W': 0x1|0x8,
-        'S': 0x2|0x4, 'Y': 0x2|0x8, 'K': 0x4|0x8
+    'A': 0x1, 'C': 0x2, 'G': 0x4, 'T': 0x8,
+    'M': 0x1|0x2, 'R': 0x1|0x4, 'W': 0x1|0x8,
+    'S': 0x2|0x4, 'Y': 0x2|0x8, 'K': 0x4|0x8
 ];
 
-bool isSiteInvariant(string site) {
-    return site.map!(a => baseToBits[a] & baseToBits[site[0]]).all();
+// Checks if a site (i.e. an alignment column) is invariant (i.e. has no phylogenetic information)
+// -NO LONGER USED-
+bool isSiteInvariant(string site)
+in {
+    assert(!site.empty);
+}
+body {
+    int front = baseToBits[site[0]];
+    foreach (c; site) {
+        if (!(baseToBits[c] & front)) return false;
+    }
+    return true;
 }
 
 unittest {
@@ -166,7 +176,6 @@ unittest {
     assert(isSiteInvariant("MCMCCCMAAAACAACACCCM"));
     assert(isSiteInvariant("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"));
     assert(!isSiteInvariant("ACAAAAAAAA"));
-    assert(isSiteInvariant(""));
 }
 
 // Parse a list of key-value pairs into a hash map.
@@ -211,12 +220,10 @@ unittest {
 }
 
 // TODO: reduce number of params by passing cmdline options struct directly
-// TODO: add sequence context encoding
 void processVcfLine(ref Sequence[] sequences, ref Sequence reference, string line,
         bool excludeInvariant, int mintot, int minalt, bool gInfo, bool ambiguityIsRef,
         bool fullContext)
-in { if (fullContext) assert(ambiguityIsRef); }
-body {
+{
     // Grab what we want from the tab-separated fields
     auto splitLine = line.splitter("\t");
     auto chrom = pop(splitLine);
@@ -224,12 +231,12 @@ body {
     splitLine = splitLine.drop(1); // ID
     string refBase = pop(splitLine);
     auto altBase = pop(splitLine);
-    splitLine = splitLine.drop(2); // QUAL, FILTER
-    auto info = pop(splitLine);
 
     // Examine sequence context
     string pre, post;
     if (fullContext) {
+        splitLine = splitLine.drop(2); // QUAL, FILTER
+        auto info = pop(splitLine);
         auto infoHashMap = parseKeyValue(info);
         auto context = infoHashMap["SC"];
         auto centre = (context.length - 1) / 2;
@@ -239,6 +246,9 @@ body {
 
     // add a collector here to check if this site is invariant
     auto site = appender!(string)();
+
+    // This bool monitors whether we ever see an ALT residue
+    bool isVariantSite = false;
 
     // For each sample, examine its genotype and decide if it is
     // REF or ALT. Add the choice to the site
@@ -255,11 +265,12 @@ body {
                 nextSite = refBase;
                 break;
             case VariantResult.IsAlt:
+                isVariantSite = true;
                 nextSite = altBase;
                 break;
             case VariantResult.IsAmbiguous:
                 if (ambiguityIsRef) nextSite = refBase;
-                else nextSite = to!string(getAmbiguityCode(refBase ~ altBase));
+                else nextSite = getAmbiguityCode(refBase ~ altBase);
                 break;
         }
 
@@ -279,9 +290,7 @@ body {
 
     // If excludeInvariant is true, and site is invariant, then don't add
     // (return early)
-    bool siteIsInvariant = fullContext ? sort(chain(refBase, site.data).array).uniq.count == 1
-                                       : isSiteInvariant(refBase ~ site.data);
-    if (excludeInvariant && siteIsInvariant) {
+    if (excludeInvariant && !isVariantSite) {
         return;
     }
 
@@ -334,7 +343,6 @@ unittest {
     processVcfLine(seqs, refseq, line, false, 10, 5, true, true, true);
     assert(seqs[0].seq.data[3] == 'v');
     assert(seqs[1].seq.data[3] == 'v');
-    writeln(refseq);
     assert(refseq.seq.data[3] == '~');
 }
 
