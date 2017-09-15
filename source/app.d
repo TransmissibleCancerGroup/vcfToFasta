@@ -1,4 +1,5 @@
 import std.algorithm;
+import std.algorithm: sort;
 import std.conv;
 import std.file;
 import std.path: baseName;
@@ -24,6 +25,30 @@ enum VariantResult {
     IsRef,
     IsAlt,
     IsAmbiguous
+}
+
+enum char[string] ambiguityCodes = [
+        "AC": 'M', "AG": 'R', "AT": 'W',
+        "CA": 'M', "CG": 'S', "CT": 'Y',
+        "GA": 'R', "GC": 'S', "GT": 'K',
+        "TA": 'W', "TC": 'Y', "TG": 'K'
+];
+
+char getAmbiguityCode(string chars)
+in {
+    assert(chars.length == 2);
+}
+body {
+    return ambiguityCodes[chars];
+}
+
+unittest {
+    static assert(getAmbiguityCode("AC") == 'M');
+    string refBase = "A";
+    string altBase = "T";
+    char ambig = getAmbiguityCode(refBase ~ altBase);
+    assert(ambig == 'W');
+    assert(getAmbiguityCode("TA") == 'W');
 }
 
 // Reduce 2 Variant results to 1 - if they differ, result is ambiguous
@@ -122,16 +147,95 @@ unittest {
     assert(examineCoverage("::::10:8", 10, 5) == VariantResult.IsAlt);
 }
 
-void processVcfLine(ref Sequence[] sequences, ref Sequence reference, string line,
-        bool excludeInvariant, int mintot, int minalt, bool gInfo) {
 
+enum int[dchar] baseToBits = [
+        'A': 0x1, 'C': 0x2, 'G': 0x4, 'T': 0x8,
+        'M': 0x1|0x2, 'R': 0x1|0x4, 'W': 0x1|0x8,
+        'S': 0x2|0x4, 'Y': 0x2|0x8, 'K': 0x4|0x8
+];
+
+bool isSiteInvariant(string site) {
+    return site.map!(a => baseToBits[a] & baseToBits[site[0]]).all();
+}
+
+unittest {
+    static assert(isSiteInvariant("TKKKKKKKKKKTKKKKKKKKTKKTTTTKTTTTK"));
+    assert(isSiteInvariant("TYTYYYYYYTTTTYYYTYYTTYYTTTTYTTYTY"));
+    assert(isSiteInvariant("TWWTTTTWTTTWTWWWWWWTTWWWTTTWWWTTT"));
+    assert(isSiteInvariant("AAAAAAAAAAAMAMAMAAAAAMAAAAAAAAAAA"));
+    assert(isSiteInvariant("MCMCCCMAAAACAACACCCM"));
+    assert(isSiteInvariant("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"));
+    assert(!isSiteInvariant("ACAAAAAAAA"));
+    assert(isSiteInvariant(""));
+}
+
+// Parse a list of key-value pairs into a hash map.
+// Input format is "K1=V1;K2=V2;..."
+auto parseKeyValue(string input) {
+    string[string] hashmap;
+    foreach (pair; input.splitter(";")) {
+        auto keyVal = pair.splitter("=").array;
+        hashmap[keyVal[0]] = keyVal[1];
+    }
+    return hashmap;
+}
+
+unittest {
+    string[string] test = [
+        "QD": "20",
+        "SC": "TGTGTAAGCATTGGGCCTGAA",
+        "SbPval": "0"
+    ];
+    auto info = "QD=20;SC=TGTGTAAGCATTGGGCCTGAA;SbPval=0";
+    assert(parseKeyValue(info) == test);
+    assert(parseKeyValue(info)["SC"] == test["SC"]);
+}
+
+auto makeTripletList() {
+    auto alphabet = "ACGT";
+	return cartesianProduct(alphabet, alphabet, alphabet)
+		.map!(a => format("%s%s%s", a[0], a[1], a[2])).array;
+}
+
+string compressTriplet(string triplet) {
+    static tripletList = makeTripletList;
+    return to!string(to!char(countUntil(tripletList, triplet) + 63));
+}
+
+unittest {
+    static ctTripletList = makeTripletList;
+    auto rtTripletList = makeTripletList;
+    assert(ctTripletList == rtTripletList);
+    assert(compressTriplet("TCG") == "u");
+    assert(compressTriplet("ACG") == "E");
+}
+
+// TODO: reduce number of params by passing cmdline options struct directly
+// TODO: add sequence context encoding
+void processVcfLine(ref Sequence[] sequences, ref Sequence reference, string line,
+        bool excludeInvariant, int mintot, int minalt, bool gInfo, bool ambiguityIsRef,
+        bool fullContext)
+in { if (fullContext) assert(ambiguityIsRef); }
+body {
     // Grab what we want from the tab-separated fields
     auto splitLine = line.splitter("\t");
     auto chrom = pop(splitLine);
     auto pos = pop(splitLine);
-    splitLine = splitLine.drop(1);
+    splitLine = splitLine.drop(1); // ID
     string refBase = pop(splitLine);
-    auto altBase = splitLine.front;
+    auto altBase = pop(splitLine);
+    splitLine = splitLine.drop(2); // QUAL, FILTER
+    auto info = pop(splitLine);
+
+    // Examine sequence context
+    string pre, post;
+    if (fullContext) {
+        auto infoHashMap = parseKeyValue(info);
+        auto context = infoHashMap["SC"];
+        auto centre = (context.length - 1) / 2;
+        pre = to!string(context[centre-1]);
+        post = to!string(context[centre+1]);
+    }
 
     // add a collector here to check if this site is invariant
     auto site = appender!(string)();
@@ -142,27 +246,41 @@ void processVcfLine(ref Sequence[] sequences, ref Sequence reference, string lin
         VariantResult result;
         if (gInfo) result = examineGenotype(genotypeData);
         else result = examineCoverage(genotypeData, mintot, minalt);
+        string nextSite;
         switch (result) {
             default:
-                site ~= refBase;
+                nextSite = refBase;
                 break;
             case VariantResult.IsRef:
-                site ~= refBase;
+                nextSite = refBase;
                 break;
             case VariantResult.IsAlt:
-                site ~= altBase;
+                nextSite = altBase;
                 break;
             case VariantResult.IsAmbiguous:
-                site ~= refBase;
+                if (ambiguityIsRef) nextSite = refBase;
+                else nextSite = to!string(getAmbiguityCode(refBase ~ altBase));
                 break;
         }
+
+        // If using base triplet compression then we need to convert
+        // our current refBase and altBase. If not, the compressedRefBase
+        // is the same as refBase
+        if (fullContext) {
+            nextSite = compressTriplet(pre ~ nextSite ~ post);
+        }
+        site ~= nextSite;
     }
 
-    // Have a look at the site, check if it's invariant. Remember to check the reference, too.
-    bool siteIsInvariant = array(chain(refBase, site.data)).sort().uniq.count == 1;
+    // Compress the refBase
+    if (fullContext) {
+        refBase = compressTriplet(pre ~ refBase ~ post);
+    }
 
-    // If excludeInvariant is true, and siteIsInvariant, then don't add
+    // If excludeInvariant is true, and site is invariant, then don't add
     // (return early)
+    bool siteIsInvariant = fullContext ? sort(chain(refBase, site.data).array).uniq.count == 1
+                                       : isSiteInvariant(refBase ~ site.data);
     if (excludeInvariant && siteIsInvariant) {
         return;
     }
@@ -174,6 +292,7 @@ void processVcfLine(ref Sequence[] sequences, ref Sequence reference, string lin
     }
 }
 
+
 // This struct represents a sequence. It holds the sequence name (`name`)
 // and an appender (`seq`) to hold the growing sequence
 struct Sequence {
@@ -182,34 +301,41 @@ struct Sequence {
 }
 
 unittest {
-    string line = "\t\t\tT\tC\t\t\t\tGT:GL:GOF:GQ:NR:NV\t1/1::::8:0\t1/1::::15:6";
+    string line = "\t\t\tT\tC\t\t\tSC=TGTTTCG\tGT:GL:GOF:GQ:NR:NV\t1/1::::8:0\t1/1::::15:6";
     Sequence[] seqs = [Sequence("a"), Sequence("b")];
     Sequence refseq = Sequence("ref");
 
     // Use genotype strings - both sites are alt
-    processVcfLine(seqs, refseq, line, false, 10, 5, true);
+    processVcfLine(seqs, refseq, line, false, 10, 5, true, true, false);
     assert(seqs[0].seq.data[0] == 'C');
     assert(seqs[1].seq.data[0] == 'C');
     assert(refseq.seq.data[0] == 'T');
 
     // Use coverage counts - site 1 is ref, 2 is alt
-    processVcfLine(seqs, refseq, line, false, 10, 5, false);
+    processVcfLine(seqs, refseq, line, false, 8, 5, false, true, false);
     assert(seqs[0].seq.data[1] == 'T');
     assert(seqs[1].seq.data[1] == 'C');
     assert(refseq.seq.data[1] == 'T');
 
     // Use coverage counts - both sites are ref at these thresholds
     // this site is invariant, but not filtered out
-    processVcfLine(seqs, refseq, line, false, 100, 50, false);
+    processVcfLine(seqs, refseq, line, false, 8, 8, false, true, false);
     assert(seqs[0].seq.data[2] == 'T' && seqs[0].seq.data.length == 3);
     assert(seqs[1].seq.data[2] == 'T' && seqs[1].seq.data.length == 3);
     assert(refseq.seq.data[2] == 'T' && refseq.seq.data.length == 3);
 
     // As above, but filtered out (array is same size)
-    processVcfLine(seqs, refseq, line, true, 100, 50, false);
+    processVcfLine(seqs, refseq, line, true, 8, 8, false, true, false);
     assert(seqs[0].seq.data.length == 3);
     assert(seqs[1].seq.data.length == 3);
     assert(refseq.seq.data.length == 3);
+
+    // Compressed sequence context
+    processVcfLine(seqs, refseq, line, false, 10, 5, true, true, true);
+    assert(seqs[0].seq.data[3] == 'v');
+    assert(seqs[1].seq.data[3] == 'v');
+    writeln(refseq);
+    assert(refseq.seq.data[3] == '~');
 }
 
 
@@ -228,6 +354,19 @@ struct Options {
             "variant sites, rather than numerical filters "~
             "(default = off)")
     OptionFlag useGenotypeInfo;
+
+    @Option("ambiguityIsRef", "r")
+    @Help("Ambiguous calls are conservatively called as the reference base. "~
+            "If switched off, sites are called as the IUPAC ambiguity code "~
+            "standing for Ref/Base (default = off)")
+    OptionFlag ambiguityIsRef;
+
+    @Option("fullContext", "f")
+    @Help("EXPERIMENTAL: output in a format that carries triplet sequence context information. "~
+            "Each triplet is encoded as its position in the alphabetical list [AAA, AAC, AAG, ... TTT] "~
+            "+63, converted to ascii. Not compatible with ambiguity codes, so enforces ambiguityIsRef "~
+            "to be switched on when fullContext is active")
+    OptionFlag fullContext;
 
     @Option("min_total_cov", "c")
     @Help("Minimum number of reads (total) needed to consider "~
@@ -266,6 +405,7 @@ int main(string[] args)
         write(help);
         return 0;
     }
+    if (options.fullContext == OptionFlag.yes) options.ambiguityIsRef = OptionFlag.yes;
     return run(options);
 }
 
@@ -308,12 +448,14 @@ int run(Options options) {
                 // Process a line and extract next sequence residue
                 processVcfLine(sequences, refseq, to!string(line),
                     options.excludeInvariant, options.min_total_cov,
-                    options.min_alt_cov, options.useGenotypeInfo);
+                    options.min_alt_cov, options.useGenotypeInfo,
+                    options.ambiguityIsRef, options.fullContext);
             }
         }
-        catch (Throwable) {
+        catch (Throwable e) {
             writefln("Error parsing %s as VCF. Check input and try again.",
                      options.infilename);
+            // throw(e);
             return 1;
         }
 
@@ -324,6 +466,8 @@ int run(Options options) {
             stderr.flush();
         }
     }
+    stderr.writefln("Processed %d SNPs in total.", loopcounter);
+    stderr.flush();
 
     // Write Fasta to standard out
     foreach (ref sequence; chain([refseq], sequences)) {
